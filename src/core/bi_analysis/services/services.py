@@ -1,11 +1,61 @@
 import csv
 from uuid import uuid4
+from math import isnan, isinf
+import math
 from django.db import connection, transaction, models
 from rest_framework.exceptions import ValidationError
-import pandas as pd
 from psycopg2 import sql
+from openpyxl import load_workbook
+import logging
 
 from src.core.bi_analysis.bi_datasets.models import DataSetField, DataSetTable, FileUpload
+
+logger = logging.getLogger(__name__)
+
+
+class TableData:
+    __slots__ = ('columns', 'rows')
+
+    def __init__(self, columns, rows):
+        self.columns = columns or []
+        self.rows = rows or []
+
+    def __len__(self):
+        return len(self.rows)
+
+    def limited(self, limit):
+        if limit is None or limit <= 0 or len(self.rows) <= limit:
+            return self
+        return TableData(self.columns, self.rows[:limit])
+
+
+def _normalize_header(header):
+    if not header:
+        return []
+    normalized = []
+    for col in header:
+        if col is None:
+            normalized.append('')
+        else:
+            normalized.append(str(col))
+    return normalized
+
+
+def _ensure_row(values, expected_len):
+    row = list(values or [])
+    if expected_len and len(row) < expected_len:
+        row.extend([None] * (expected_len - len(row)))
+    elif expected_len and len(row) > expected_len:
+        row = row[:expected_len]
+    return row
+
+
+def _is_null(val):
+    if val is None:
+        return True
+    if isinstance(val, float):
+        return isnan(val)
+    return False
 
 def populate_initial_fields(dataset, temp_table_name, staging_table=None):
     """
@@ -49,8 +99,12 @@ def populate_initial_fields_from_file(dataset, file_upload, source_table):
     Читает файл напрямую через pandas для получения списка колонок.
     """
     try:
-        df = read_file_to_dataframe(file_upload.id)
-        cols = list(df.columns.astype(str))
+        table = read_file_to_dataframe(
+            file_upload.id,
+            sheet_name=getattr(source_table, 'sheet_name', None),
+            row_limit=0
+        )
+        cols = table.columns
     except Exception as e:
         # Fallback: используем columns_info если есть
         if file_upload.columns_info and 'columns' in file_upload.columns_info:
@@ -85,7 +139,11 @@ def find_existing_temp_table_for_file(file_upload_id):
     Проверяет таблицы через DataSetTable и также все staging_ таблицы с нужными колонками.
     """
     try:
-        upload = FileUpload.objects.get(pk=file_upload_id)
+        try:
+            upload = FileUpload.objects.get(pk=file_upload_id)
+        except FileUpload.DoesNotExist:
+            logger.error(f"FileUpload с id={file_upload_id} не найден")
+            return None
         
         # Сначала проверяем через DataSetTable
         existing_tables = DataSetTable.objects.filter(file_upload_id=file_upload_id)
@@ -98,14 +156,12 @@ def find_existing_temp_table_for_file(file_upload_id):
         # Если не нашли через DataSetTable, проверяем все staging_ таблицы
         # Загружаем ожидаемые колонки из файла для сравнения
         cols_from_file = []
-        if upload.file_type == 'xlsx':
-            df = pd.read_excel(upload.file.path, header=0, nrows=0)
-            cols_from_file = list(df.columns.astype(str))
-        elif upload.file_type in ('csv', 'txt'):
-            with open(upload.file.path, 'r', encoding='cp1251', errors='replace', newline='') as f:
-                reader = csv.reader(f)
-                cols_from_file = next(reader, [])
-        
+        if upload.file_type in ('xlsx', 'csv', 'txt'):
+            table = read_file_to_dataframe(upload.id, row_limit=0)
+            cols_from_file = table.columns
+        else:
+            cols_from_file = []
+
         if cols_from_file:
             # Ищем все staging_ таблицы с таким же набором колонок
             # Также проверяем temp_ для обратной совместимости
@@ -405,104 +461,190 @@ def sync_dataset_fields_with_current_table(dataset):
             field.delete()
 
 
-def read_file_to_dataframe(file_upload_id):
-    """Читает файл в pandas DataFrame"""
-    upload = FileUpload.objects.get(pk=file_upload_id)
+DEFAULT_PREVIEW_LIMIT = 1000
+
+
+def _read_excel_table(path, sheet_name=None, row_limit=None):
+    wb = load_workbook(filename=path, read_only=True, data_only=True)
+    try:
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                wb.close()
+                raise ValidationError(f"Лист '{sheet_name}' не найден в файле")
+            ws = wb[sheet_name]
+        else:
+            ws = wb[wb.sheetnames[0]]
+    except IndexError:
+        wb.close()
+        return TableData([], [])
+
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    columns = _normalize_header(header)
+
+    if row_limit == 0:
+        wb.close()
+        return TableData(columns, [])
+
+    rows = []
+    for row in rows_iter:
+        rows.append(_ensure_row(row, len(columns)))
+        if row_limit and row_limit > 0 and len(rows) >= row_limit:
+            break
+
+    wb.close()
+    return TableData(columns, rows)
+
+
+def _read_csv_table(path, row_limit=None, encoding='cp1251'):
+    with open(path, 'r', encoding=encoding, errors='replace', newline='') as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        columns = _normalize_header(header)
+
+        if row_limit == 0:
+            return TableData(columns, [])
+
+        rows = []
+        for row in reader:
+            rows.append(_ensure_row(row, len(columns)))
+            if row_limit and row_limit > 0 and len(rows) >= row_limit:
+                break
+
+    return TableData(columns, rows)
+
+
+def read_file_to_dataframe(file_upload_id, sheet_name=None, row_limit=None, use_polars=True):
+    """
+    Читает файл в табличную структуру.
+    Использует polars для максимальной производительности, если доступен.
+    Поддерживает чтение из бинарных файлов .bin.
+    """
+    try:
+        upload = FileUpload.objects.get(pk=file_upload_id)
+    except FileUpload.DoesNotExist:
+        raise ValidationError(f"FileUpload с id={file_upload_id} не найден")
+    
+    if not upload.file:
+        raise ValidationError(f"FileUpload {file_upload_id} не имеет файла")
+    
     path = upload.file.path
     
+    # Проверяем, является ли файл бинарным
+    from src.core.bi_analysis.bi_datasets.binary_storage import is_binary_file, read_from_binary
+    
+    # Если row_limit=None, читаем все данные. Если указан, используем его.
+    # Это универсальное решение для CSV и Excel через polars
+    
+    if is_binary_file(path) or upload.file_type == 'bin':
+        # Читаем из бинарного файла
+        try:
+            # Если row_limit=None, читаем все данные
+            columns, rows = read_from_binary(path, row_limit=row_limit)
+            return TableData(columns, rows)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Ошибка чтения бинарного файла: {str(e)}")
+            raise ValidationError(f"Ошибка чтения бинарного файла: {str(e)}")
+    
+    # Используем polars для чтения файлов (универсальное решение для CSV и Excel)
+    if use_polars:
+        try:
+            from src.core.bi_analysis.tasks import _read_file_with_polars
+            # Передаем row_limit как есть: None = читать все данные, число = лимит
+            columns, rows = _read_file_with_polars(file_upload_id, sheet_name, row_limit)
+            return TableData(columns, rows)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Не удалось использовать polars, используется fallback метод: {str(e)}")
+    
+    # Fallback на старый метод (только если polars недоступен)
+    sheet = sheet_name or getattr(upload, 'sheet_name', None)
+
     if upload.file_type == 'xlsx':
-        return pd.read_excel(path, header=0)
+        return _read_excel_table(path, sheet, row_limit=row_limit)
     elif upload.file_type in ('csv', 'txt'):
-        return pd.read_csv(path, encoding='cp1251', on_bad_lines='skip')
+        return _read_csv_table(path, row_limit=row_limit)
     else:
         raise ValidationError(f"Неподдерживаемый тип файла: {upload.file_type}")
 
 
-def dataframe_to_sql_values(df, table_alias='t0'):
+def dataframe_to_sql_values(table, table_alias='t0', row_limit=None):
     """
-    Преобразует DataFrame в SQL.
-    Для небольших файлов использует VALUES, для больших - временную таблицу на время запроса.
-    Временная таблица автоматически удалится после выполнения запроса.
+    Преобразует TableData в SQL (VALUES ...).
+    
+    Args:
+        table: TableData объект с данными
+        table_alias: алиас таблицы в SQL запросе
+        row_limit: лимит строк для включения в VALUES. Если None, ограничиваем до разумного максимума.
     """
-    if df.empty:
+    if not table.columns:
         return sql.SQL('(SELECT NULL::text AS col WHERE FALSE)'), None
+
+    # Ограничиваем количество строк в VALUES clause для производительности
+    # Используем настройку из .env (BI_PREVIEW_MAX_VALUES_ROWS)
+    from django.conf import settings
+    MAX_VALUES_ROWS = getattr(settings, 'BI_PREVIEW_MAX_VALUES_ROWS', 10000)
     
-    # Для файлов больше 1000 строк используем временную таблицу
-    # Для меньших файлов используем VALUES (быстрее для PostgreSQL)
-    MAX_VALUES_ROWS = 1000
-    
-    if len(df) > MAX_VALUES_ROWS:
-        # Используем временную таблицу, которая удалится автоматически после запроса
-        temp_table_name = f"temp_query_{uuid4().hex[:16]}"
-        
-        # Создаем таблицу
-        col_defs = ", ".join(
-            f'"{str(c).replace(chr(34), chr(34) + chr(34))}" TEXT' 
-            for c in df.columns
-        )
-        
-        with connection.cursor() as cursor:
-            # Создаем временную таблицу (ON COMMIT DROP - удалится после транзакции)
-            cursor.execute(f'CREATE TEMPORARY TABLE "{temp_table_name}" ({col_defs}) ON COMMIT DROP;')
-            
-            # Вставляем данные пакетами
-            placeholders = ", ".join(["%s"] * len(df.columns))
-            insert_sql = f'INSERT INTO "{temp_table_name}" VALUES ({placeholders})'
-            
-            data_rows = []
-            for _, row in df.iterrows():
-                values = []
-                for val in row.values:
-                    if pd.isna(val):
-                        values.append(None)
-                    else:
-                        values.append(str(val))
-                data_rows.append(values)
-            
-            if data_rows:
-                cursor.executemany(insert_sql, data_rows)
-        
-        # Возвращаем ссылку на временную таблицу
-        return sql.SQL('"{}" AS {}').format(
-            sql.Identifier(temp_table_name),
-            sql.Identifier(table_alias)
-        ), None
+    if row_limit is not None and row_limit > 0:
+        # Если указан лимит, используем его, но не больше максимума
+        limited = table.limited(min(row_limit, MAX_VALUES_ROWS))
     else:
-        # Для небольших файлов используем VALUES
-        data_rows = []
-        for _, row in df.iterrows():
-            values = []
-            for val in row.values:
-                if pd.isna(val):
-                    values.append('NULL')
-                else:
-                    # Экранируем значения для SQL
-                    val_str = str(val).replace("'", "''")
-                    values.append(f"'{val_str}'")
-            data_rows.append(f"({', '.join(values)})")
-        
-        # Создаем список колонок
-        col_defs = []
-        for col in df.columns:
-            col_name = str(col).replace('"', '""')
-            col_defs.append(f'"{col_name}"')
-        
-        # Строим VALUES подзапрос
-        if len(data_rows) == 0:
-            return sql.SQL('(SELECT NULL::text AS col WHERE FALSE)'), None
-        
-        values_clause = ',\n'.join(data_rows)
-        col_list = ', '.join(col_defs)
-        
-        # Используем подзапрос с VALUES
-        values_query = f"""
-            (VALUES {values_clause}) AS {table_alias}({col_list})
-        """
-        
-        return sql.SQL(values_query), None
+        # Если лимит не указан, ограничиваем до максимума
+        limited = table.limited(MAX_VALUES_ROWS)
+    
+    if len(limited) == 0:
+        return sql.SQL('(SELECT NULL::text AS col WHERE FALSE)'), None
+
+    def sanitize(val):
+        if _is_null(val):
+            return 'NULL'
+        # Обрабатываем разные типы данных
+        if isinstance(val, bool):
+            return 'TRUE' if val else 'FALSE'
+        if isinstance(val, (int, float)):
+            # Проверяем на infinity
+            if isinstance(val, float) and (math.isinf(val) or math.isnan(val)):
+                return 'NULL'
+            return str(val)
+        # Для строк экранируем кавычки
+        val_str = str(val).replace("'", "''")
+        return f"'{val_str}'"
+
+    data_rows = []
+    for row in limited.rows:
+        # Проверяем, что строка не пустая
+        if not row:
+            continue
+        sanitized = [sanitize(val) for val in row]
+        # Проверяем, что после санитизации есть данные
+        if sanitized:
+            data_rows.append(f"({', '.join(sanitized)})")
+    
+    # Если после обработки нет строк, возвращаем пустой результат
+    if not data_rows:
+        return sql.SQL('(SELECT NULL::text AS col WHERE FALSE)'), None
+
+    col_defs = []
+    for col in limited.columns:
+        col_name = str(col).replace('"', '""')
+        if not col_name:
+            col_name = 'column'
+        col_defs.append(f'"{col_name}"')
+
+    values_clause = ',\n'.join(data_rows)
+    col_list = ', '.join(col_defs)
+
+    values_query = f"""
+        (VALUES {values_clause}) AS {table_alias}({col_list})
+    """
+
+    return sql.SQL(values_query), None
 
 
-def build_dataset_query(dataset, select_fields=None, limit=None, where_clause=None):
+def build_dataset_query(dataset, select_fields=None, limit=None, offset=None, where_clause=None, search=None):
     """
     Строит SQL-запрос для датасета на основе метаданных таблиц и полей.
     Для файловых источников читает данные напрямую из файлов без создания таблиц.
@@ -511,7 +653,9 @@ def build_dataset_query(dataset, select_fields=None, limit=None, where_clause=No
         dataset: объект Dataset
         select_fields: список имен полей для SELECT (None = все поля)
         limit: лимит строк
+        offset: смещение для пагинации
         where_clause: дополнительное условие WHERE
+        search: строка поиска (будет добавлена в WHERE как LIKE по всем текстовым полям)
     
     Returns:
         SQL объект для выполнения запроса
@@ -529,9 +673,25 @@ def build_dataset_query(dataset, select_fields=None, limit=None, where_clause=No
     
     if is_file_source:
         # Для файловых источников читаем данные напрямую из файла
+        # Вычисляем сколько строк нужно прочитать: limit + offset (если есть)
+        # Для больших файлов читаем все данные, но лимит будет применен в SQL
+        file_read_limit = None
+        if limit is not None:
+            # Читаем достаточно данных с учетом offset
+            file_read_limit = limit + (offset or 0)
+            # Но если лимит очень большой, читаем все данные для эффективности
+            if file_read_limit > 50000:
+                file_read_limit = None
+        
         try:
-            df = read_file_to_dataframe(main_table.file_upload_id)
-            from_with_alias, _ = dataframe_to_sql_values(df, main_alias)
+            df = read_file_to_dataframe(
+                main_table.file_upload_id,
+                sheet_name=getattr(main_table, 'sheet_name', None),
+                row_limit=file_read_limit
+            )
+            # Передаем None для row_limit в dataframe_to_sql_values, чтобы включить все прочитанные данные
+            # Лимит и offset будут применены в SQL запросе через LIMIT/OFFSET clauses
+            from_with_alias, _ = dataframe_to_sql_values(df, main_alias, row_limit=None)
         except Exception as e:
             raise ValueError(f"Ошибка чтения файла: {str(e)}")
     else:
@@ -568,9 +728,15 @@ def build_dataset_query(dataset, select_fields=None, limit=None, where_clause=No
         
         if is_join_file_source:
             # Для файловых источников читаем данные напрямую из файла
+            # Для JOIN таблиц также читаем все данные, лимит будет применен к итоговому запросу
             try:
-                df_join = read_file_to_dataframe(join_table.file_upload_id)
-                join_table_ref, _ = dataframe_to_sql_values(df_join, table_alias)
+                df_join = read_file_to_dataframe(
+                    join_table.file_upload_id,
+                    sheet_name=getattr(join_table, 'sheet_name', None),
+                    row_limit=None  # Читаем все данные для JOIN
+                )
+                # Передаем None для row_limit, чтобы включить все данные для JOIN
+                join_table_ref, _ = dataframe_to_sql_values(df_join, table_alias, row_limit=None)
             except Exception as e:
                 raise ValueError(f"Ошибка чтения файла для JOIN: {str(e)}")
         else:
@@ -669,9 +835,39 @@ def build_dataset_query(dataset, select_fields=None, limit=None, where_clause=No
     # Добавляем JOIN'ы
     query_parts.extend(joins)
     
-    # Добавляем WHERE если есть
+    # Собираем условия WHERE
+    where_conditions = []
+    
     if where_clause:
-        query_parts.append(sql.SQL('WHERE {}').format(sql.SQL(where_clause)))
+        where_conditions.append(sql.SQL(where_clause))
+    
+    # Добавляем поиск по всем текстовым полям
+    if search:
+        search_conditions = []
+        # Получаем все поля для поиска
+        search_fields = dataset.fields.all() if select_fields is None else dataset.fields.filter(name__in=select_fields)
+        
+        for field in search_fields:
+            table_alias = table_aliases.get(field.source_table.id, main_alias)
+            # Ищем только в текстовых полях (предполагаем, что все поля могут быть текстовыми)
+            search_conditions.append(
+                sql.SQL('CAST({}.{} AS TEXT) ILIKE {}').format(
+                    sql.Identifier(table_alias),
+                    sql.Identifier(field.source_column),
+                    sql.Literal(f'%{search}%')
+                )
+            )
+        
+        if search_conditions:
+            where_conditions.append(sql.SQL('({})').format(sql.SQL(' OR ').join(search_conditions)))
+    
+    # Добавляем WHERE если есть условия
+    if where_conditions:
+        query_parts.append(sql.SQL('WHERE {}').format(sql.SQL(' AND ').join(where_conditions)))
+    
+    # Добавляем OFFSET если есть
+    if offset is not None and offset > 0:
+        query_parts.append(sql.SQL('OFFSET {}').format(sql.Literal(offset)))
     
     # Добавляем LIMIT если есть
     if limit is not None:
