@@ -381,16 +381,10 @@ class DatasetPreviewView(APIView):
         if not dataset:
             return Response({"detail": "Not found"}, status=404)
 
-        limit = int(request.query_params.get('limit', 1000))
+        limit = int(request.query_params.get('limit', 1000000))
         offset = int(request.query_params.get('offset', 0))
         search = request.query_params.get('search', '').strip()
         use_async = request.query_params.get('async', 'false').lower() == 'true'
-        
-        # Проверяем максимальный лимит из настроек (.env)
-        from django.conf import settings
-        max_limit = getattr(settings, 'BI_PREVIEW_MAX_VALUES_ROWS', 10000)
-        if limit > max_limit:
-            limit = max_limit
         
         try:
             # Проверяем, есть ли таблицы в датасете
@@ -415,7 +409,18 @@ class DatasetPreviewView(APIView):
             if use_fast_path:
                 # Быстрый путь: прямое чтение файла через polars, как в upload эндпоинте
                 try:
-                    from src.core.bi_analysis.services.services import read_file_to_dataframe
+                    from src.core.bi_analysis.services.services import read_file_to_dataframe, count_file_rows
+                    
+                    # Подсчитываем общее количество строк (только при первой загрузке или если offset=0)
+                    total_count = None
+                    if offset == 0:
+                        try:
+                            total_count = count_file_rows(
+                                main_table.file_upload_id,
+                                sheet_name=getattr(main_table, 'sheet_name', None)
+                            )
+                        except Exception as e:
+                            logger.warning(f"Не удалось подсчитать общее количество строк: {str(e)}")
                     
                     # Читаем файл с лимитом строк
                     table_data = read_file_to_dataframe(
@@ -431,11 +436,17 @@ class DatasetPreviewView(APIView):
                     # Преобразуем строки в список кортежей (как в SQL результате)
                     rows_tuples = [tuple(row) for row in rows]
                     
-                    return Response({
+                    response_data = {
                         "columns": columns,
                         "rows": rows_tuples,
                         "has_more": len(rows) == limit  # Указываем, есть ли еще данные
-                    })
+                    }
+                    
+                    # Добавляем total_count, если он был подсчитан
+                    if total_count is not None:
+                        response_data["total_count"] = total_count
+                    
+                    return Response(response_data)
                 except Exception as e:
                     # Если не удалось использовать быстрый путь, используем обычный
                     logger.warning(f"Не удалось использовать быстрый путь для preview: {str(e)}. Используется SQL путь.")
@@ -444,7 +455,9 @@ class DatasetPreviewView(APIView):
                 # Асинхронная обработка только для действительно больших лимитов или при явном запросе
                 # Увеличиваем порог, чтобы для обычных случаев (до 5000 строк) использовался синхронный режим
                 async_threshold = 5000
-                should_use_async = use_async or (limit > async_threshold and has_joins)
+                # Проверяем limit только если он указан (не None)
+                limit_exceeds_threshold = limit is not None and limit > async_threshold
+                should_use_async = use_async or (limit_exceeds_threshold and has_joins)
                 
                 if should_use_async:
                     try:
@@ -461,11 +474,29 @@ class DatasetPreviewView(APIView):
                         # Продолжаем выполнение в синхронном режиме ниже
             
             # Обычный путь: через SQL запрос (для JOIN'ов, поиска, offset и т.д.)
-            from src.core.bi_analysis.services.services import build_dataset_query
+            from src.core.bi_analysis.services.services import build_dataset_query, build_dataset_count_query
+            
+            # Подсчитываем общее количество строк (только при первой загрузке или если offset=0)
+            total_count = None
+            if offset == 0:
+                try:
+                    count_query = build_dataset_count_query(
+                        dataset,
+                        search=search if search else None
+                    )
+                    with connection.cursor() as count_cursor:
+                        count_cursor.execute(count_query)
+                        total_count = count_cursor.fetchone()[0]
+                except Exception as e:
+                    logger.warning(f"Не удалось подсчитать общее количество строк: {str(e)}")
+            
+            # При поиске не применяем лимит, чтобы поиск выполнялся по всем данным
+            # Без поиска используем лимит для пагинации
+            query_limit = None if search else limit
             
             query = build_dataset_query(
                 dataset, 
-                limit=limit, 
+                limit=query_limit, 
                 offset=offset,
                 search=search if search else None
             )
@@ -482,11 +513,17 @@ class DatasetPreviewView(APIView):
         except Exception as e:
             return Response({"detail": f"Ошибка: {str(e)}"}, status=500)
 
-        return Response({
+        response_data = {
             "columns": columns,
             "rows": rows,
             "has_more": len(rows) == limit  # Указываем, есть ли еще данные
-        })
+        }
+        
+        # Добавляем total_count, если он был подсчитан
+        if total_count is not None:
+            response_data["total_count"] = total_count
+        
+        return Response(response_data)
 
 
 class DatasetPreviewTaskStatusView(APIView):
@@ -592,8 +629,11 @@ class DatasetDraftPreviewView(APIView):
         from django.conf import settings
         
         use_async = data.get('async', False)
-        # Лимит берется из настроек Django (из .env переменной VITE_BI_PREVIEW_ROWS_LIMIT)
-        limit = int(data.get('limit', getattr(settings, 'BI_PREVIEW_ROWS_LIMIT', 1000)))
+        # Лимиты убраны - если limit не указан, загружаем все данные
+        # Если limit указан, используем его для пагинации
+        limit = data.get('limit')
+        if limit is not None:
+            limit = int(limit)
         
         # Для больших лимитов или множества файлов используем асинхронную обработку
         file_count = sum([
@@ -602,7 +642,9 @@ class DatasetDraftPreviewView(APIView):
         ])
         
         async_threshold = getattr(settings, 'BI_PREVIEW_ASYNC_THRESHOLD', 5000)
-        if use_async or limit > async_threshold or file_count > 2:
+        # Проверяем limit только если он указан (не None)
+        limit_exceeds_threshold = limit is not None and limit > async_threshold
+        if use_async or limit_exceeds_threshold or file_count > 2:
             try:
                 from src.core.bi_analysis.tasks import process_draft_preview
                 task = process_draft_preview.delay(data)
@@ -648,12 +690,8 @@ class DatasetDraftPreviewView(APIView):
             file_read_limit = None
             if limit is not None:
                 # Читаем достаточно данных с учетом offset и небольшого запаса
+                # Убрано ограничение MAX_VALUES_ROWS - загружаем все строки
                 file_read_limit = limit + (offset or 0) + 100  # Запас в 100 строк для корректной работы
-                # Ограничиваем максимальное количество строк в VALUES (чтобы не создавать огромные SQL запросы)
-                # Для больших файлов используем разумный лимит
-                MAX_VALUES_ROWS = getattr(settings, 'BI_PREVIEW_MAX_VALUES_ROWS', 10000)
-                if file_read_limit > MAX_VALUES_ROWS:
-                    file_read_limit = MAX_VALUES_ROWS
             
             try:
                 df_main = read_file_to_dataframe(
@@ -999,6 +1037,21 @@ class FileUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
         encoding   = request.query_params.get('encoding', 'utf-8')
         delimiter  = request.query_params.get('delimiter', ',')
         has_header = request.query_params.get('has_header', 'true').lower() == 'true'
+        
+        # Пагинация строк
+        limit = request.query_params.get('limit')
+        offset = request.query_params.get('offset', '0')
+        limit = int(limit) if limit else None
+        offset = int(offset) if offset else 0
+        
+        # Подсчитываем общее количество строк для пагинации
+        total_rows_count = None
+        try:
+            from src.core.bi_analysis.services.services import count_file_rows
+            sheet_name = request.query_params.get('sheet_name') or request.query_params.get('sheet')
+            total_rows_count = count_file_rows(instance.id, sheet_name)
+        except Exception as e:
+            logger.warning(f"Не удалось подсчитать строки для файла {instance.id}: {str(e)}")
 
         try:
             # Проверяем, является ли файл бинарным
@@ -1007,11 +1060,24 @@ class FileUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
             if is_binary_file(instance.file.path) or instance.file_type == 'bin':
                 # Читаем из бинарного файла
                 columns, rows = read_from_binary(instance.file.path, row_limit=None)
-                if has_header and rows:
-                    parsed = [columns, *rows]
+                
+                # Применяем пагинацию
+                total_count = len(rows)
+                if limit is not None:
+                    paginated_rows = rows[offset:offset + limit]
                 else:
-                    parsed = rows
+                    paginated_rows = rows[offset:]
+                
+                if has_header and paginated_rows:
+                    parsed = [columns, *paginated_rows]
+                else:
+                    parsed = paginated_rows
+                
                 data['parsed'] = parsed
+                if total_rows_count is None:
+                    data['total_count'] = total_count
+                else:
+                    data['total_count'] = total_rows_count
                 return Response(data)
             
             if instance.file_type in ('csv', 'txt'):
@@ -1063,13 +1129,51 @@ class FileUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
                                         cleaned_row.append(value)
                                 rows_list.append(cleaned_row)
                             
-                            if has_header:
-                                parsed = [list(columns), *rows_list]
+                            # Применяем пагинацию
+                            total_count = len(rows_list)
+                            if limit is not None:
+                                paginated_rows = rows_list[offset:offset + limit]
                             else:
-                                parsed = rows_list
+                                paginated_rows = rows_list[offset:]
+                            
+                            if has_header:
+                                parsed = [list(columns), *paginated_rows]
+                            else:
+                                parsed = paginated_rows
+                            
+                            # Добавляем общее количество строк
+                            if total_rows_count is None:
+                                data['total_count'] = total_count
+                            else:
+                                data['total_count'] = total_rows_count
                     except ImportError:
                         # Polars не установлен, используем старый метод
-                        parsed = self._parse_csv(instance.file.path, encoding, delimiter, has_header)
+                        all_parsed = self._parse_csv(instance.file.path, encoding, delimiter, has_header)
+                        
+                        # Применяем пагинацию
+                        if has_header and len(all_parsed) > 1:
+                            header = [all_parsed[0]]
+                            rows = all_parsed[1:]
+                            total_count = len(rows)
+                            if limit is not None:
+                                paginated_rows = rows[offset:offset + limit]
+                            else:
+                                paginated_rows = rows[offset:]
+                            parsed = header + paginated_rows
+                            if total_rows_count is None:
+                                data['total_count'] = total_count
+                            else:
+                                data['total_count'] = total_rows_count
+                        else:
+                            total_count = len(all_parsed)
+                            if limit is not None:
+                                parsed = all_parsed[offset:offset + limit]
+                            else:
+                                parsed = all_parsed[offset:]
+                            if total_rows_count is None:
+                                data['total_count'] = total_count
+                            else:
+                                data['total_count'] = total_rows_count
 
             elif instance.file_type == 'xlsx':
                 # Читаем через Polars для эффективной обработки больших Excel файлов
@@ -1120,21 +1224,84 @@ class FileUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
                                 cleaned_row.append(value)
                         rows_list.append(cleaned_row)
                     
-                    if has_header and rows_list:
-                        parsed = [list(columns), *rows_list]
+                    # Применяем пагинацию
+                    total_count = len(rows_list)
+                    if limit is not None:
+                        paginated_rows = rows_list[offset:offset + limit]
                     else:
-                        parsed = rows_list
+                        paginated_rows = rows_list[offset:]
+                    
+                    if has_header and paginated_rows:
+                        parsed = [list(columns), *paginated_rows]
+                    else:
+                        parsed = paginated_rows
+                    
+                    # Добавляем общее количество строк
+                    if total_rows_count is None:
+                        data['total_count'] = total_count
+                    else:
+                        data['total_count'] = total_rows_count
                         
                 except ImportError:
                     # Polars не установлен, используем старый метод
-                    parsed, sheets = self._parse_xlsx(instance.file.path, has_header)
+                    all_parsed, sheets = self._parse_xlsx(instance.file.path, has_header)
                     data['sheets'] = sheets
+                    
+                    # Применяем пагинацию
+                    if has_header and len(all_parsed) > 1:
+                        header = [all_parsed[0]]
+                        rows = all_parsed[1:]
+                        total_count = len(rows)
+                        if limit is not None:
+                            paginated_rows = rows[offset:offset + limit]
+                        else:
+                            paginated_rows = rows[offset:]
+                        parsed = header + paginated_rows
+                        if total_rows_count is None:
+                            data['total_count'] = total_count
+                        else:
+                            data['total_count'] = total_rows_count
+                    else:
+                        total_count = len(all_parsed)
+                        if limit is not None:
+                            parsed = all_parsed[offset:offset + limit]
+                        else:
+                            parsed = all_parsed[offset:]
+                        if total_rows_count is None:
+                            data['total_count'] = total_count
+                        else:
+                            data['total_count'] = total_rows_count
                 except Exception as e:
                     logger.error(f"Ошибка при чтении Excel через Polars: {e}")
                     # Fallback на старый метод
                     try:
-                        parsed, sheets = self._parse_xlsx(instance.file.path, has_header)
+                        all_parsed, sheets = self._parse_xlsx(instance.file.path, has_header)
                         data['sheets'] = sheets
+                        
+                        # Применяем пагинацию
+                        if has_header and len(all_parsed) > 1:
+                            header = [all_parsed[0]]
+                            rows = all_parsed[1:]
+                            total_count = len(rows)
+                            if limit is not None:
+                                paginated_rows = rows[offset:offset + limit]
+                            else:
+                                paginated_rows = rows[offset:]
+                            parsed = header + paginated_rows
+                            if total_rows_count is None:
+                                data['total_count'] = total_count
+                            else:
+                                data['total_count'] = total_rows_count
+                        else:
+                            total_count = len(all_parsed)
+                            if limit is not None:
+                                parsed = all_parsed[offset:offset + limit]
+                            else:
+                                parsed = all_parsed[offset:]
+                            if total_rows_count is None:
+                                data['total_count'] = total_count
+                            else:
+                                data['total_count'] = total_rows_count
                     except Exception as e2:
                         logger.error(f"Ошибка при чтении Excel через fallback метод: {e2}")
                         raise ValidationError(f"Ошибка чтения Excel файла: {str(e2)}")
@@ -1642,7 +1809,10 @@ class XlsxTempPreviewView(APIView):
         temp_path     = request_data.get('temp_path')
         has_header    = request_data.get('has_header', 'true').lower() == 'true' if isinstance(request_data.get('has_header'), str) else True
         sheet_name    = request_data.get('sheet_name')
-        row_limit     = int(request_data.get('row_limit', 200))
+        # Лимиты убраны - если row_limit не указан, загружаем все данные
+        row_limit = request_data.get('row_limit')
+        if row_limit is not None:
+            row_limit = int(row_limit)
         use_async     = request_data.get('async', 'false').lower() == 'true' if isinstance(request_data.get('async'), str) else False
 
         if not temp_path or not os.path.exists(temp_path):
@@ -1651,7 +1821,8 @@ class XlsxTempPreviewView(APIView):
         # Определяем размер файла для выбора стратегии
         file_size = os.path.getsize(temp_path)
         # Для файлов больше 5MB или при явном запросе используем асинхронную обработку
-        should_use_async = use_async or file_size > 5 * 1024 * 1024 or row_limit > 500
+        # Если row_limit не указан (None), считаем что это большой файл и используем асинхронную обработку
+        should_use_async = use_async or file_size > 5 * 1024 * 1024 or (row_limit is not None and row_limit > 500) or row_limit is None
 
         if should_use_async:
             from src.core.bi_analysis.tasks import process_file_preview

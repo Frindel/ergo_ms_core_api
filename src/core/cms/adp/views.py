@@ -30,6 +30,7 @@ from src.core.utils.base.base_views import BaseAPIView, BaseAPIViewAuthMixin
 from django.contrib.auth.models import User
 
 from src.core.utils.database.main import OrderedDictQueryExecutor
+from src.config.settings.auth import get_token_lifetime
 
 class UserRegistrationValidationView(BaseAPIView):
     @swagger_auto_schema(
@@ -60,10 +61,6 @@ class UserRegistrationValidationView(BaseAPIView):
                     type=openapi.TYPE_STRING, 
                     format=openapi.FORMAT_PASSWORD, 
                     description='Подтверждение пароля'
-                ),
-                'is_superuser': openapi.Schema(
-                    type=openapi.TYPE_BOOLEAN,                      
-                    description='Является ли суперпользователем'
                 ),
             },
 
@@ -284,10 +281,6 @@ class UserRegistrationView(BaseAPIView):
                     format=openapi.FORMAT_PASSWORD, 
                     description='Подтверждение пароля'
                 ),
-                'is_superuser': openapi.Schema(
-                    type=openapi.TYPE_BOOLEAN,                      
-                    description='Является ли суперпользователем'
-                ),
             },
 
             required=['first_name', 'username', 'email', 'password', 'password_confirm'],
@@ -301,11 +294,15 @@ class UserRegistrationView(BaseAPIView):
         serializer = UserRegistrationSerializer(data=request.data)
 
         if serializer.is_valid():
-            User.objects.create_superuser(username=serializer.validated_data['username'], email= serializer.validated_data['email'], password= serializer.validated_data['password']).save()
+            user = serializer.save()
 
             successful_response = Response(
-                {"message": "Регистрация успешна."}, 
-                status=status.HTTP_200_OK
+                {
+                    "message": "Регистрация успешна.",
+                    "user_id": user.id,
+                    "username": user.username
+                }, 
+                status=status.HTTP_201_CREATED
             )
             return successful_response
 
@@ -330,13 +327,13 @@ class UserAuthorizationView(BaseAPIView):
                     format=openapi.FORMAT_PASSWORD,
                     description='Пароль'
                 ),
-                'password_confirm': openapi.Schema(
-                    type=openapi.TYPE_STRING,
-                    format=openapi.FORMAT_PASSWORD,
-                    description='Подтверждение пароля'
+                'remember_me': openapi.Schema(
+                    type=openapi.TYPE_BOOLEAN,
+                    description='Запомнить меня (увеличенное время жизни токенов)',
+                    default=False
                 ),
             },
-            required=['username', 'password', 'password_confirm'],
+            required=['username', 'password'],
         ),
         responses={
             200: openapi.Response(
@@ -358,6 +355,7 @@ class UserAuthorizationView(BaseAPIView):
         if serializer.is_valid():
             username = serializer.validated_data['username']
             password = serializer.validated_data['password']
+            remember_me = request.data.get('remember_me', False)
 
             user = authenticate(request, username=username, password=password)
 
@@ -365,11 +363,22 @@ class UserAuthorizationView(BaseAPIView):
                 # Создаем или обновляем информацию об устройстве
                 self._create_or_update_device(request, user)
                 
+                # Получаем время жизни токенов в зависимости от remember_me
+                access_lifetime, refresh_lifetime = get_token_lifetime(remember_me)
+                
+                # Создаем токены с кастомным временем жизни
                 refresh = RefreshToken.for_user(user)
+                refresh.set_exp(lifetime=refresh_lifetime)
+                
+                # ВАЖНО: сохраняем access_token в переменную, т.к. каждое обращение
+                # к refresh.access_token создаёт новый токен с дефолтным временем
+                access_token = refresh.access_token
+                access_token.set_exp(lifetime=access_lifetime)
+                
                 return Response(
                     {
                         'refresh': str(refresh),
-                        'access': str(refresh.access_token),
+                        'access': str(access_token),
                         'user_id': user.id
                     },
                     status=status.HTTP_200_OK

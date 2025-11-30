@@ -60,6 +60,25 @@ logger.info("Celery: Загружены конфигурации модулей:
 module_task_routes = module_manager.get_all_task_routes()
 module_task_queues = module_manager.get_all_task_queues()
 
+# ==================== Настройка параллелизма очередей ====================
+# Инициализируем менеджер параллелизма для ограничения одновременных задач по очередям
+if not is_beat:
+    # Настраиваем только для worker'а, не для beat
+    module_manager.setup_queue_concurrency()
+    
+    # Собираем лимиты для логирования
+    queue_limits = module_manager.get_all_queue_limits()
+    if queue_limits:
+        logger.info(
+            "Celery: Настроены лимиты параллелизма: %s",
+            ", ".join(f"{q}={l}" for q, l in queue_limits.items())
+        )
+        
+        # Активируем автоматическое ограничение через Custom Task class
+        # Это переопределяет __call__ и проверяет лимит ДО выполнения задачи
+        from src.core.utils.celery.concurrency import setup_concurrency_limited_tasks
+        setup_concurrency_limited_tasks(celery_app)
+
 # Гарантируем наличие очереди по умолчанию
 if 'default' not in module_task_queues:
     module_task_queues['default'] = {
@@ -247,3 +266,37 @@ celery_app.conf.update(
     # Дополнительные настройки из модулей
     **module_manager.get_additional_configs()
 )
+
+# ==================== Синхронизация задач с БД ====================
+# Синхронизируем задачи из конфига с БД при использовании DatabaseScheduler
+# Выполняется только при запуске beat, после полной инициализации Django
+if is_beat and CELERY_BEAT_SCHEDULER and CELERY_BEAT_SCHEDULER_DB_ALIAS and CELERY_BEAT_SCHEDULE:
+    try:
+        # Убеждаемся, что Django полностью инициализирован
+        import django
+        from django.apps import apps
+        
+        # Проверяем, инициализирован ли Django
+        if not apps.ready:
+            django.setup()
+        
+        from src.core.utils.celery_beat.sync import CeleryBeatSyncManager
+        
+        logger.info("Beat: Начало синхронизации задач с БД...")
+        logger.info(f"Beat: db_alias={CELERY_BEAT_SCHEDULER_DB_ALIAS}, задач в конфиге={len(CELERY_BEAT_SCHEDULE)}")
+        
+        sync_manager = CeleryBeatSyncManager(
+            config_schedule=CELERY_BEAT_SCHEDULE,
+            db_alias=CELERY_BEAT_SCHEDULER_DB_ALIAS
+        )
+        sync_results = sync_manager.sync_all()
+        
+        logger.info(
+            f"Beat: Синхронизация задач с БД завершена - "
+            f"создано: {sync_results['created']}, "
+            f"обновлено: {sync_results['updated']}, "
+            f"удалено: {sync_results['deleted']}"
+        )
+    except Exception as e:
+        logger.error(f"Beat: Ошибка синхронизации задач с БД: {e}", exc_info=True)
+        # Не прерываем запуск, но логируем ошибку
